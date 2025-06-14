@@ -124,6 +124,32 @@ impl<T: Sync + Send> ThreadSafeVar<T> for SlotPairTSV<T> {
 		new_version
 	}
 }
+impl<T: Sync + Send + Debug> Debug for SlotPairTSV<T> {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		self.get().fmt(f)
+	}
+}
+impl<T: Sync + Send + PartialEq> PartialEq for SlotPairTSV<T> {
+	fn eq(&self, other: &Self) -> bool {
+		self.get().eq(&other.get())
+	}
+}
+impl<T: Sync + Send + Eq> Eq for SlotPairTSV<T> {}
+impl<T: Sync + Send + PartialOrd> PartialOrd for SlotPairTSV<T> {
+	fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+		self.get().partial_cmp(&other.get())
+	}
+}
+impl<T: Sync + Send + Ord> Ord for SlotPairTSV<T> {
+	fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+		self.get().cmp(&other.get())
+	}
+}
+impl<T: Sync + Send + Hash> Hash for SlotPairTSV<T> {
+	fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+		self.get().hash(state);
+	}
+}
 
 const N_VARS: usize = 2;
 pub struct InnerSlotPairTSV<T: Sync + Send> {
