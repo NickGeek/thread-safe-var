@@ -29,8 +29,106 @@ impl<T: Sync + Send> Drop for Var<T> {
 	}
 }
 
+pub struct SlotPairTSV<T: Sync + Send>(Pin<Box<InnerSlotPairTSV<T>>>);
+impl<T: Sync + Send> SlotPairTSV<T> {
+	pub fn new(data: T) -> Self {
+		Self(InnerSlotPairTSV::new(data))
+	}
+}
+impl<T: Sync + Send> ThreadSafeVar<T> for SlotPairTSV<T> {
+	#[allow(refining_impl_trait)]
+	fn get(&self) -> Reader<T> {
+		// Fast path if we've already read the value in this thread.
+		if let Some(wrapper) = self.0.local_key.get() {
+			let wrapper = unsafe { &*wrapper.get() };
+			if wrapper.version == self.0.next_version.load(Ordering::Acquire) - 1 {
+				let data = Arc::clone(&**wrapper);
+				return Reader(data)
+			}
+		}
+
+		loop {
+			let version = self.0.next_version.load(Ordering::Acquire);
+			assert_ne!(version, 0);
+			let version = version - 1;
+			// Get what we hope is still the current slot
+			let slot_idx = (version & 0x1) as usize;
+			let var = &self.0.vars[slot_idx];
+			// We picked a slot, but we could just have lost against one or more
+			// writers. So far nothing we've done would block any number of
+			// them.
+			// We increment `n_readers` for the slot we picked to keep out
+			// writers that would try to set the value in the slot we picked.
+			var.n_readers.fetch_add(1, Ordering::SeqCst);
+			// Repeat until we win the race.
+			if self.0.next_version.load(Ordering::Acquire) == version + 1 {
+				let wrapper = var.wrapper.load(Ordering::Relaxed);
+				assert!(!wrapper.is_null());
+				let wrapper = ManuallyDrop::new(unsafe { Arc::from_raw(wrapper) });
+				let res = Reader(Arc::clone(&*wrapper));
+				if var.n_readers.fetch_sub(1, Ordering::SeqCst) == 1
+					&& self.0.next_version.load(Ordering::Acquire) != res.version() + 1 {
+					// If we were the last reader, signal a writer that it can write.
+					self.0.signal_writer();
+				}
+				let thread_key = self.0.local_key
+					.get_or_try(|| Ok::<_,Infallible>(UnsafeCell::new(ManuallyDrop::new(Arc::clone(&*wrapper))))).unwrap();
+				let cached_wrapper = unsafe { &mut *thread_key.get() };
+				let did_set = cached_wrapper.as_ptr() == wrapper.as_ptr();
+				if !did_set {
+					unsafe { ManuallyDrop::drop(cached_wrapper) }
+					*cached_wrapper = ManuallyDrop::new(Arc::clone(&*wrapper));
+				}
+				return res;
+			}
+			if var.n_readers.fetch_sub(1, Ordering::SeqCst) == 1 {
+				self.0.signal_writer();
+			}
+		}
+	}
+
+	fn put(&self, data: T) -> Version {
+		let write_lock = self.0.write_lock.lock();
+
+		// let v1 = unsafe { &*self.0.vars[1].other_slot };
+		// let v2 = unsafe { &*self.0.vars[0].other_slot };
+
+		// next_version is stable because we hold the write lock.
+		let new_version = self.0.next_version.load(Ordering::Acquire);
+		assert_ne!(0, new_version, "Wrapper version should not be 0 because it is incremented on initialisation");
+		let wrapper = Arc::new(Wrapper::new(data, new_version));
+		// Safety: I do not mutate this value.
+		let wrapper_raw = unsafe { Arc::into_raw_mut(wrapper) };
+
+		// Grab the next slot
+		let var_idx = ((new_version + 1) & 0x1) as usize;
+		let var = unsafe { &*self.0.vars[var_idx].other_slot };
+		let old_wrapper = var.wrapper.load(Ordering::Acquire);
+		assert!(!old_wrapper.is_null(), "Wrapper should not be null because it is set on initialisation");
+		assert!(!ptr::eq(old_wrapper, wrapper_raw), "New wrapper should not be the same as the old one");
+		// let old_wrapper = unsafe { Arc::from_raw(old_wrapper) };
+
+		// Wait for our slot to be dormant before we write to it.
+		let mut can_write_signal = self.0.waiting_writer_signaler.lock();
+		while var.n_readers.load(Ordering::Acquire) > 0 {
+			self.0.waiting_writer_cv.wait(&mut can_write_signal);
+		}
+		drop(can_write_signal);
+
+		// Now we can write to the slot, it's not being read by anyone.
+		var.wrapper.compare_exchange(old_wrapper, wrapper_raw, Ordering::SeqCst, Ordering::SeqCst).unwrap();
+		self.0.next_version.fetch_add(1, Ordering::SeqCst);
+
+		// Drop the old wrapper
+		let old_wrapper = unsafe { Arc::from_raw(old_wrapper) };
+		drop(old_wrapper);
+		drop(write_lock);
+		new_version
+	}
+}
+
 const N_VARS: usize = 2;
-pub struct SlotPairTSV<T: Sync + Send> {
+pub struct InnerSlotPairTSV<T: Sync + Send> {
 	vars: [Var<T>; N_VARS],
 	next_version: AtomicU64,
 	local_key: ThreadLocal<UnsafeCell<ManuallyDrop<Arc<Wrapper<T>>>>>,
@@ -42,9 +140,9 @@ pub struct SlotPairTSV<T: Sync + Send> {
 	/// Suppress [Unpin] because our vars are self-referential.
 	_pin: PhantomPinned,
 }
-impl<T: Sync + Send> SlotPairTSV<T> {
+impl<T: Sync + Send> InnerSlotPairTSV<T> {
 	pub fn new(data: T) -> Pin<Box<Self>> {
-		let mut tsv = MaybeUninit::<SlotPairTSV<T>>::uninit();
+		let mut tsv = MaybeUninit::<InnerSlotPairTSV<T>>::uninit();
 		let tsv = unsafe {
 			let tsv_ptr = tsv.as_mut_ptr();
 			addr_of_mut!((*tsv_ptr).next_version).write(AtomicU64::new(0));
@@ -103,97 +201,7 @@ impl<T: Sync + Send> SlotPairTSV<T> {
 	}
 
 }
-impl<T: Sync + Send> ThreadSafeVar<T> for SlotPairTSV<T> {
-	fn get(&self) -> impl ThreadSafeVarRef<T> {
-		// Fast path if we've already read the value in this thread.
-		if let Some(wrapper) = self.local_key.get() {
-			let wrapper = unsafe { &*wrapper.get() };
-			if wrapper.version == self.next_version.load(Ordering::Acquire) - 1 {
-				let data = Arc::clone(&**wrapper);
-				return Reader(data)
-			}
-		}
-
-		loop {
-			let version = self.next_version.load(Ordering::Acquire);
-			assert_ne!(version, 0);
-			let version = version - 1;
-			// Get what we hope is still the current slot
-			let slot_idx = (version & 0x1) as usize;
-			let var = &self.vars[slot_idx];
-			// We picked a slot, but we could just have lost against one or more
-			// writers. So far nothing we've done would block any number of
-			// them.
-			// We increment `n_readers` for the slot we picked to keep out
-			// writers that would try to set the value in the slot we picked.
-			var.n_readers.fetch_add(1, Ordering::SeqCst);
-			// Repeat until we win the race.
-			if self.next_version.load(Ordering::Acquire) == version + 1 {
-				let wrapper = var.wrapper.load(Ordering::Relaxed);
-				assert!(!wrapper.is_null());
-				let wrapper = ManuallyDrop::new(unsafe { Arc::from_raw(wrapper) });
-				let res = Reader(Arc::clone(&*wrapper));
-				if var.n_readers.fetch_sub(1, Ordering::SeqCst) == 1
-					&& self.next_version.load(Ordering::Acquire) != res.version() + 1 {
-					// If we were the last reader, signal a writer that it can write.
-					self.signal_writer();
-				}
-				let thread_key = self.local_key
-					.get_or_try(|| Ok::<_,Infallible>(UnsafeCell::new(ManuallyDrop::new(Arc::clone(&*wrapper))))).unwrap();
-				let cached_wrapper = unsafe { &mut *thread_key.get() };
-				let did_set = cached_wrapper.as_ptr() == wrapper.as_ptr();
-				if !did_set {
-					unsafe { ManuallyDrop::drop(cached_wrapper) }
-					*cached_wrapper = ManuallyDrop::new(Arc::clone(&*wrapper));
-				}
-				return res;
-			}
-			if var.n_readers.fetch_sub(1, Ordering::SeqCst) == 1 {
-				self.signal_writer();
-			}
-		}
-	}
-
-	fn put(&self, data: T) -> Version {
-		let write_lock = self.write_lock.lock();
-
-		// let v1 = unsafe { &*self.vars[1].other_slot };
-		// let v2 = unsafe { &*self.vars[0].other_slot };
-
-		// next_version is stable because we hold the write lock.
-		let new_version = self.next_version.load(Ordering::Acquire);
-		assert_ne!(0, new_version, "Wrapper version should not be 0 because it is incremented on initialisation");
-		let wrapper = Arc::new(Wrapper::new(data, new_version));
-		// Safety: I do not mutate this value.
-		let wrapper_raw = unsafe { Arc::into_raw_mut(wrapper) };
-
-		// Grab the next slot
-		let var_idx = ((new_version + 1) & 0x1) as usize;
-		let var = unsafe { &*self.vars[var_idx].other_slot };
-		let old_wrapper = var.wrapper.load(Ordering::Acquire);
-		assert!(!old_wrapper.is_null(), "Wrapper should not be null because it is set on initialisation");
-		assert!(!ptr::eq(old_wrapper, wrapper_raw), "New wrapper should not be the same as the old one");
-		// let old_wrapper = unsafe { Arc::from_raw(old_wrapper) };
-
-		// Wait for our slot to be dormant before we write to it.
-		let mut can_write_signal = self.waiting_writer_signaler.lock();
-		while var.n_readers.load(Ordering::Acquire) > 0 {
-			self.waiting_writer_cv.wait(&mut can_write_signal);
-		}
-		drop(can_write_signal);
-
-		// Now we can write to the slot, it's not being read by anyone.
-		var.wrapper.compare_exchange(old_wrapper, wrapper_raw, Ordering::SeqCst, Ordering::SeqCst).unwrap();
-		self.next_version.fetch_add(1, Ordering::SeqCst);
-
-		// Drop the old wrapper
-		let old_wrapper = unsafe { Arc::from_raw(old_wrapper) };
-		drop(old_wrapper);
-		drop(write_lock);
-		new_version
-	}
-}
-impl<T: Sync + Send> Drop for SlotPairTSV<T> {
+impl<T: Sync + Send> Drop for InnerSlotPairTSV<T> {
 	fn drop(&mut self) {
 		if let Some(cached_wrapper) = self.local_key.get() {
 			let value = unsafe { &mut *cached_wrapper.get() };

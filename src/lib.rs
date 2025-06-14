@@ -33,17 +33,17 @@ mod tests {
 	fn can_write() {
 		let tsv = SlotPairTSV::new("Hi!".to_string());
 		assert_eq!(0, tsv.get().version());
-		assert_eq!("Hi!", tsv.get().deref());
-		assert_eq!("Hi!", tsv.get().deref());
+		assert_eq!("Hi!", *tsv.get());
+		assert_eq!("Hi!", *tsv.get());
 
 		let new_version = tsv.put("Hello!".to_string());
 		assert_eq!(1, new_version);
-		assert_eq!("Hello!", tsv.get().deref());
-		assert_eq!("Hello!", tsv.get().deref());
+		assert_eq!("Hello!", *tsv.get());
+		assert_eq!("Hello!", *tsv.get());
 
 		let new_version = tsv.put("Bye!".to_string());
 		assert_eq!(2, new_version);
-		assert_eq!("Bye!", tsv.get().deref());
-		assert_eq!("Bye!", tsv.get().deref());
+		assert_eq!("Bye!", *tsv.get());
+		assert_eq!("Bye!", *tsv.get());
 	}
 }
