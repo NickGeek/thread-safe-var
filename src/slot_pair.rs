@@ -5,6 +5,8 @@ use parking_lot::{Condvar, Mutex};
 use rclite::Arc;
 use std::cell::UnsafeCell;
 use std::convert::Infallible;
+use std::fmt::Debug;
+use std::hash::Hash;
 use std::marker::PhantomPinned;
 use std::mem::{ManuallyDrop, MaybeUninit};
 use std::ops::Deref;
@@ -242,5 +244,31 @@ impl<T: Sync + Send> Deref for Reader<T> {
 	type Target = T;
 	fn deref(&self) -> &Self::Target {
 		&self.0.data
+	}
+}
+impl<T: Sync + Send + Debug> Debug for Reader<T> {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		self.0.data.fmt(f)
+	}
+}
+impl<T: Sync + Send + PartialEq> PartialEq for Reader<T> {
+	fn eq(&self, other: &Self) -> bool {
+		self.0.data == other.0.data
+	}
+}
+impl<T: Sync + Send + Eq> Eq for Reader<T> {}
+impl<T: Sync + Send + PartialOrd> PartialOrd for Reader<T> {
+	fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+		self.0.data.partial_cmp(&other.0.data)
+	}
+}
+impl<T: Sync + Send + Ord> Ord for Reader<T> {
+	fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+		self.0.data.cmp(&other.0.data)
+	}
+}
+impl<T: Sync + Send + Hash> Hash for Reader<T> {
+	fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+		self.0.data.hash(state);
 	}
 }
