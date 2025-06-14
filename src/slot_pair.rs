@@ -105,7 +105,6 @@ impl<T: Sync + Send> ThreadSafeVar<T> for SlotPairTSV<T> {
 		let old_wrapper = var.wrapper.load(Ordering::Acquire);
 		assert!(!old_wrapper.is_null(), "Wrapper should not be null because it is set on initialisation");
 		assert!(!ptr::eq(old_wrapper, wrapper_raw), "New wrapper should not be the same as the old one");
-		// let old_wrapper = unsafe { Arc::from_raw(old_wrapper) };
 
 		// Wait for our slot to be dormant before we write to it.
 		let mut can_write_signal = self.0.waiting_writer_signaler.lock();
