@@ -92,9 +92,6 @@ impl<T: Sync + Send> ThreadSafeVar<T> for SlotPairTSV<T> {
 	fn put(&self, data: T) -> Version {
 		let write_lock = self.0.write_lock.lock();
 
-		// let v1 = unsafe { &*self.0.vars[1].other_slot };
-		// let v2 = unsafe { &*self.0.vars[0].other_slot };
-
 		// next_version is stable because we hold the write lock.
 		let new_version = self.0.next_version.load(Ordering::Acquire);
 		assert_ne!(0, new_version, "Wrapper version should not be 0 because it is incremented on initialisation");
