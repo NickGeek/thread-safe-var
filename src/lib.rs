@@ -7,13 +7,14 @@ mod slot_pair;
 
 pub type Version = u64;
 
-pub trait ThreadSafeVar<T: Send> {
+pub trait ThreadSafeVar<T: Send + 'static> {
 	fn get(&self) -> impl ThreadSafeVarRef<T>;
 	fn put(&self, data: T) -> Version;
 }
 
-pub trait ThreadSafeVarRef<T: Send>: Deref<Target = T> {
+pub trait ThreadSafeVarRef<T: Send>: Deref<Target = T> + Clone + Sync + Send + 'static {
 	fn version(&self) -> Version;
+	fn get(&self) -> &T;
 }
 
 #[cfg(test)]

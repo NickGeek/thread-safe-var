@@ -16,7 +16,7 @@ use std::ptr::addr_of_mut;
 use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use thread_local::ThreadLocal;
 
-struct Var<T: Sync + Send> {
+struct Var<T: Sync + Send + 'static> {
 	wrapper: AtomicPtr<Wrapper<T>>,
 	other_slot: *mut Var<T>,
 	n_readers: AtomicU32,
@@ -31,7 +31,7 @@ impl<T: Sync + Send> Drop for Var<T> {
 	}
 }
 
-pub struct SlotPairTSV<T: Sync + Send>(Pin<Box<InnerSlotPairTSV<T>>>);
+pub struct SlotPairTSV<T: Sync + Send + 'static>(Pin<Box<InnerSlotPairTSV<T>>>);
 impl<T: Sync + Send> SlotPairTSV<T> {
 	pub fn new(data: T) -> Self {
 		Self(InnerSlotPairTSV::new(data))
@@ -152,7 +152,7 @@ impl<T: Sync + Send + Hash> Hash for SlotPairTSV<T> {
 }
 
 const N_VARS: usize = 2;
-pub struct InnerSlotPairTSV<T: Sync + Send> {
+pub struct InnerSlotPairTSV<T: Sync + Send + 'static> {
 	vars: [Var<T>; N_VARS],
 	next_version: AtomicU64,
 	local_key: ThreadLocal<UnsafeCell<ManuallyDrop<Arc<Wrapper<T>>>>>,
@@ -255,12 +255,17 @@ impl<T: Sync + Send> Wrapper<T> {
 // 	}
 // }
 
-#[derive(Clone)]
-pub struct Reader<T: Sync + Send>(Arc<Wrapper<T>>);
-impl<T: Sync + Send> ThreadSafeVarRef<T> for Reader<T> {
+pub struct Reader<T: Sync + Send + 'static>(Arc<Wrapper<T>>);
+impl<T: Sync + Send + 'static> Clone for Reader<T> {
+	fn clone(&self) -> Self {
+		Self(Arc::clone(&self.0))
+	}
+}
+impl<T: Sync + Send + 'static> ThreadSafeVarRef<T> for Reader<T> {
 	fn version(&self) -> Version {
 		self.0.version
 	}
+	fn get(&self) -> &T { self }
 }
 impl<T: Sync + Send> Deref for Reader<T> {
 	type Target = T;
