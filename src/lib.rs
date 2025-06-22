@@ -9,7 +9,7 @@ pub type Version = u64;
 
 pub trait ThreadSafeVar<T: Send + 'static> {
 	fn get(&self) -> impl ThreadSafeVarRef<T>;
-	fn put(&self, data: T) -> Version;
+	fn set(&self, data: T) -> Version;
 }
 
 pub trait ThreadSafeVarRef<T: Send>: Deref<Target = T> + Clone + Sync + Send + 'static {
@@ -19,6 +19,7 @@ pub trait ThreadSafeVarRef<T: Send>: Deref<Target = T> + Clone + Sync + Send + '
 
 #[cfg(test)]
 mod tests {
+	use rclite::Arc;
 	use super::*;
 
 	#[test]
@@ -37,12 +38,46 @@ mod tests {
 		assert_eq!("Hi!", *tsv.get());
 		assert_eq!("Hi!", *tsv.get());
 
-		let new_version = tsv.put("Hello!".to_string());
+		let new_version = tsv.set("Hello!".to_string());
 		assert_eq!(1, new_version);
 		assert_eq!("Hello!", *tsv.get());
 		assert_eq!("Hello!", *tsv.get());
 
-		let new_version = tsv.put("Bye!".to_string());
+		let new_version = tsv.set("Bye!".to_string());
+		assert_eq!(2, new_version);
+		assert_eq!("Bye!", *tsv.get());
+		assert_eq!("Bye!", *tsv.get());
+	}
+
+	#[test]
+	fn can_read_and_write_across_threads() {
+		let tsv = Arc::new(SlotPairTSV::new("Hi!".to_string()));
+		assert_eq!(0, tsv.get().version());
+		assert_eq!("Hi!", *tsv.get());
+		assert_eq!("Hi!", *tsv.get());
+		let tsv_ = tsv.clone();
+		let jh1 = std::thread::spawn(move || {
+			assert_eq!(0, tsv_.get().version());
+			let reader = tsv_.get();
+			assert_eq!("Hi!", *reader);
+			assert_eq!("Hi!", *reader);
+		});
+		let tsv_ = tsv.clone();
+		let jh2 = std::thread::spawn(move || {
+			assert_eq!(0, tsv_.get().version());
+			let reader = tsv_.get();
+			assert_eq!("Hi!", *reader);
+			assert_eq!("Hi!", *reader);
+		});
+		jh1.join().unwrap();
+		jh2.join().unwrap();
+
+		let new_version = tsv.set("Hello!".to_string());
+		assert_eq!(1, new_version);
+		assert_eq!("Hello!", *tsv.get());
+		assert_eq!("Hello!", *tsv.get());
+
+		let new_version = tsv.set("Bye!".to_string());
 		assert_eq!(2, new_version);
 		assert_eq!("Bye!", *tsv.get());
 		assert_eq!("Bye!", *tsv.get());

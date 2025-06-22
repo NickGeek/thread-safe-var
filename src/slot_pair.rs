@@ -89,7 +89,7 @@ impl<T: Sync + Send> ThreadSafeVar<T> for SlotPairTSV<T> {
 		}
 	}
 
-	fn put(&self, data: T) -> Version {
+	fn set(&self, data: T) -> Version {
 		let write_lock = self.0.write_lock.lock();
 
 		// next_version is stable because we hold the write lock.
@@ -248,12 +248,12 @@ impl<T: Sync + Send> Wrapper<T> {
 		}
 	}
 }
-// Debug drop impl
-// impl<T: Sync + Send> Drop for Wrapper<T> {
-// 	fn drop(&mut self) {
-// 		eprintln!("Dropping Wrapper with version {}", self.version);
-// 	}
-// }
+#[cfg(feature = "verbose")]
+impl<T: Sync + Send> Drop for Wrapper<T> {
+	fn drop(&mut self) {
+		eprintln!("Dropping Wrapper with version {}", self.version);
+	}
+}
 
 pub struct Reader<T: Sync + Send + 'static>(Arc<Wrapper<T>>);
 impl<T: Sync + Send + 'static> Clone for Reader<T> {
