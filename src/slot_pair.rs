@@ -1,10 +1,9 @@
 // See LICENCE.md and INCLUDED_WORKS.md for licence and copyright information.
 
+use crate::thread_local::ThreadLocal;
 use crate::{ThreadSafeVar, ThreadSafeVarRef, Version};
 use parking_lot::{Condvar, Mutex};
 use rclite::Arc;
-use std::cell::UnsafeCell;
-use std::convert::Infallible;
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::marker::PhantomPinned;
@@ -14,7 +13,6 @@ use std::pin::Pin;
 use std::ptr;
 use std::ptr::addr_of_mut;
 use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
-use thread_local::ThreadLocal;
 
 struct Var<T: Sync + Send + 'static> {
 	wrapper: AtomicPtr<Wrapper<T>>,
@@ -42,10 +40,10 @@ impl<T: Sync + Send> ThreadSafeVar<T> for SlotPairTSV<T> {
 	fn get(&self) -> Reader<T> {
 		// Fast path if we've already read the value in this thread.
 		if let Some(wrapper) = self.0.local_key.get() {
-			let wrapper = unsafe { &*wrapper.get() };
+			// Safety: wrapper is a valid pointer until the clone is done.
+			let wrapper = unsafe { &*wrapper }.clone();
 			if wrapper.version == self.0.next_version.load(Ordering::Acquire) - 1 {
-				let data = Arc::clone(&**wrapper);
-				return Reader(data)
+				return Reader(wrapper)
 			}
 		}
 
@@ -73,14 +71,7 @@ impl<T: Sync + Send> ThreadSafeVar<T> for SlotPairTSV<T> {
 					// If we were the last reader, signal a writer that it can write.
 					self.0.signal_writer();
 				}
-				let thread_key = self.0.local_key
-					.get_or_try(|| Ok::<_,Infallible>(UnsafeCell::new(ManuallyDrop::new(Arc::clone(&*wrapper))))).unwrap();
-				let cached_wrapper = unsafe { &mut *thread_key.get() };
-				let did_set = cached_wrapper.as_ptr() == wrapper.as_ptr();
-				if !did_set {
-					unsafe { ManuallyDrop::drop(cached_wrapper) }
-					*cached_wrapper = ManuallyDrop::new(Arc::clone(&*wrapper));
-				}
+				self.0.local_key.set(Arc::clone(&*wrapper)).unwrap();
 				return res;
 			}
 			if var.n_readers.fetch_sub(1, Ordering::SeqCst) == 1 {
@@ -155,7 +146,7 @@ const N_VARS: usize = 2;
 pub struct InnerSlotPairTSV<T: Sync + Send + 'static> {
 	vars: [Var<T>; N_VARS],
 	next_version: AtomicU64,
-	local_key: ThreadLocal<UnsafeCell<ManuallyDrop<Arc<Wrapper<T>>>>>,
+	local_key: ThreadLocal<Arc<Wrapper<T>>>,
 	write_lock: Mutex<()>,
 	waiter_signaler: Mutex<()>,
 	waiter_cv: Condvar,
@@ -226,13 +217,7 @@ impl<T: Sync + Send> InnerSlotPairTSV<T> {
 
 }
 impl<T: Sync + Send> Drop for InnerSlotPairTSV<T> {
-	fn drop(&mut self) {
-		if let Some(cached_wrapper) = self.local_key.get() {
-			let value = unsafe { &mut *cached_wrapper.get() };
-			unsafe { ManuallyDrop::drop(value) };
-			self.local_key.clear();
-		}
-	}
+	fn drop(&mut self) {}
 }
 
 #[derive(Clone)]
@@ -297,5 +282,11 @@ impl<T: Sync + Send + Ord> Ord for Reader<T> {
 impl<T: Sync + Send + Hash> Hash for Reader<T> {
 	fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
 		self.0.data.hash(state);
+	}
+}
+#[cfg(feature = "verbose")]
+impl<T: Sync + Send> Drop for Reader<T> {
+	fn drop(&mut self) {
+		eprintln!("Dropping Reader with version {} (refs = {})", self.0.version, self.0.strong_count());
 	}
 }

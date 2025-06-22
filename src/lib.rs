@@ -4,6 +4,7 @@ pub use slot_pair::{SlotPairTSV, Reader};
 use std::ops::Deref;
 
 mod slot_pair;
+mod thread_local;
 
 pub type Version = u64;
 
