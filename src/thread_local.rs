@@ -42,6 +42,10 @@ impl<T: Send + Sync> ThreadLocal<T> {
 		}
 	}
 
+	/// Sets the thread-local variable to the given data. If the thread-local variable
+	/// already contains data, it will be replaced with the new data and the old data will be dropped.
+	/// This means that any active references to the old data will be invalid, and it will be UB to
+	/// use them.
 	pub fn set(&self, data: T) -> Result<(), c_int> {
 		let old = self.get_raw();
 

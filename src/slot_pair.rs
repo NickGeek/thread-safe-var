@@ -6,30 +6,22 @@ use parking_lot::{Condvar, Mutex};
 use rclite::Arc;
 use std::fmt::Debug;
 use std::hash::Hash;
-use std::marker::PhantomPinned;
-use std::mem::{ManuallyDrop, MaybeUninit};
+use std::mem::ManuallyDrop;
 use std::ops::Deref;
-use std::pin::Pin;
 use std::ptr;
-use std::ptr::addr_of_mut;
 use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
 struct Var<T: Sync + Send + 'static> {
 	wrapper: AtomicPtr<Wrapper<T>>,
-	other_slot: *mut Var<T>,
 	n_readers: AtomicU32,
-	/// Suppress [Unpin] so that we cannot invalidate `other_slot` by moving `Var<T>`.
-	_pin: PhantomPinned,
 }
-unsafe impl<T: Sync + Send> Send for Var<T> {}
-unsafe impl<T: Sync + Send> Sync for Var<T> {}
 impl<T: Sync + Send> Drop for Var<T> {
 	fn drop(&mut self) {
 		unsafe { drop(Arc::from_raw(self.wrapper.load(Ordering::SeqCst))); }
 	}
 }
 
-pub struct SlotPairTSV<T: Sync + Send + 'static>(Pin<Box<InnerSlotPairTSV<T>>>);
+pub struct SlotPairTSV<T: Sync + Send + 'static>(InnerSlotPairTSV<T>);
 impl<T: Sync + Send> SlotPairTSV<T> {
 	pub fn new(data: T) -> Self {
 		Self(InnerSlotPairTSV::new(data))
@@ -40,7 +32,7 @@ impl<T: Sync + Send> ThreadSafeVar<T> for SlotPairTSV<T> {
 	fn get(&self) -> Reader<T> {
 		// Fast path if we've already read the value in this thread.
 		if let Some(wrapper) = self.0.local_key.get() {
-			// Safety: wrapper is a valid pointer until the clone is done.
+			// Safety: wrapper should be valid because we immediately clone it to ensure stability.
 			let wrapper = unsafe { &*wrapper }.clone();
 			if wrapper.version == self.0.next_version.load(Ordering::Acquire) - 1 {
 				return Reader(wrapper)
@@ -91,8 +83,8 @@ impl<T: Sync + Send> ThreadSafeVar<T> for SlotPairTSV<T> {
 		let wrapper_raw = unsafe { Arc::into_raw_mut(wrapper) };
 
 		// Grab the next slot
-		let var_idx = ((new_version + 1) & 0x1) as usize;
-		let var = unsafe { &*self.0.vars[var_idx].other_slot };
+		let other_var_idx = (new_version & 0x1) as usize;
+		let var = &self.0.vars[other_var_idx];
 		let old_wrapper = var.wrapper.load(Ordering::Acquire);
 		assert!(!old_wrapper.is_null(), "Wrapper should not be null because it is set on initialisation");
 		assert!(!ptr::eq(old_wrapper, wrapper_raw), "New wrapper should not be the same as the old one");
@@ -152,30 +144,28 @@ pub struct InnerSlotPairTSV<T: Sync + Send + 'static> {
 	waiter_cv: Condvar,
 	waiting_writer_signaler: Mutex<()>,
 	waiting_writer_cv: Condvar,
-	/// Suppress [Unpin] because our vars are self-referential.
-	_pin: PhantomPinned,
 }
 impl<T: Sync + Send> InnerSlotPairTSV<T> {
-	pub fn new(data: T) -> Pin<Box<Self>> {
-		let mut tsv = MaybeUninit::<InnerSlotPairTSV<T>>::uninit();
-		let tsv = unsafe {
-			let tsv_ptr = tsv.as_mut_ptr();
-			addr_of_mut!((*tsv_ptr).next_version).write(AtomicU64::new(0));
-			addr_of_mut!((*tsv_ptr).local_key).write(ThreadLocal::new());
-			addr_of_mut!((*tsv_ptr).write_lock).write(Mutex::new(()));
-			addr_of_mut!((*tsv_ptr).waiter_signaler).write(Mutex::new(()));
-			addr_of_mut!((*tsv_ptr).waiter_cv).write(Condvar::new());
-			addr_of_mut!((*tsv_ptr).waiting_writer_signaler).write(Mutex::new(()));
-			addr_of_mut!((*tsv_ptr).waiting_writer_cv).write(Condvar::new());
-			Self::fill_var(addr_of_mut!((*tsv_ptr).vars[0]));
-			Self::fill_var(addr_of_mut!((*tsv_ptr).vars[1]));
-
-			tsv.assume_init()
+	pub fn new(data: T) -> Self {
+		let mut tsv = Self {
+			vars: [
+				Var {
+					wrapper: AtomicPtr::new(ptr::null_mut()),
+					n_readers: AtomicU32::new(0),
+				},
+				Var {
+					wrapper: AtomicPtr::new(ptr::null_mut()),
+					n_readers: AtomicU32::new(0),
+				},
+			],
+			next_version: AtomicU64::new(0),
+			local_key: ThreadLocal::new(),
+			write_lock: Mutex::new(()),
+			waiter_signaler: Mutex::new(()),
+			waiter_cv: Condvar::new(),
+			waiting_writer_signaler: Mutex::new(()),
+			waiting_writer_cv: Condvar::new(),
 		};
-
-		let mut tsv_final_location = Box::new(tsv);
-		tsv_final_location.vars[0].other_slot = &raw mut tsv_final_location.vars[1];
-		tsv_final_location.vars[1].other_slot = &raw mut tsv_final_location.vars[0];
 
 		// Set wrapper on both slots.
 		let wrapper = Arc::new(Wrapper::new(data, 0));
@@ -183,30 +173,20 @@ impl<T: Sync + Send> InnerSlotPairTSV<T> {
 			// Safety: We do not mutate this value.
 			let wrapper = wrapper.clone();
 			let wrapper = unsafe { Arc::into_raw_mut(wrapper) };
-			let v = &mut tsv_final_location.vars[i];
+			let v = &mut tsv.vars[i];
 			v.wrapper.compare_exchange(ptr::null_mut(), wrapper, Ordering::SeqCst, Ordering::SeqCst)
 				.expect("Failed to set initial wrapper");
 		}
 		assert!(wrapper.strong_count() > 1, "Wrapper should have strong count > 1 after initialization");
-		tsv_final_location.next_version.fetch_add(1, Ordering::SeqCst);
+		tsv.next_version.fetch_add(1, Ordering::SeqCst);
 
 		{
-			let lock = tsv_final_location.waiter_signaler.lock();
-			tsv_final_location.waiter_cv.notify_one();
+			let lock = tsv.waiter_signaler.lock();
+			tsv.waiter_cv.notify_one();
 			drop(lock);
 		}
 
-		Box::into_pin(tsv_final_location)
-		// // Acquiring the write lock and immediately releasing it as a trivial memory barrier.
-		// let write_lock = res.write_lock.lock();
-		// drop(write_lock);
-	}
-	unsafe fn fill_var(var_ptr: *mut Var<T>) {
-		unsafe {
-			addr_of_mut!((*var_ptr).wrapper).write(AtomicPtr::new(ptr::null_mut()));
-			addr_of_mut!((*var_ptr).other_slot).write(ptr::null_mut());
-			addr_of_mut!((*var_ptr).n_readers).write(AtomicU32::new(0));
-		}
+		tsv
 	}
 
 	fn signal_writer(&self) {
