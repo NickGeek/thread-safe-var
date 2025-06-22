@@ -62,7 +62,6 @@ impl<T: Send + Sync> ThreadLocal<T> {
 	extern "C" fn thread_local_destructor(ptr: *mut c_void) {
 		// This is called when the thread-local variable is deleted.
 		// We can safely drop the Box here.
-		eprintln!("thread local destructor called");
 		if !ptr.is_null() {
 			drop(unsafe { Box::from_raw(ptr as *mut T) });
 		}
