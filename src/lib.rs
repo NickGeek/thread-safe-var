@@ -117,4 +117,29 @@ mod tests {
 		assert_eq!("Bye!", *tsv.get());
 		assert_eq!("Bye!", *tsv.get());
 	}
+	#[test]
+	#[cfg(not(miri))] // Needs better concurrency support in Miri
+	fn can_read_and_write_with_contention() {
+		let tsv = Arc::new(SlotPairTSV::new(0i32));
+		let tsv_ = tsv.clone();
+		let writer1 = std::thread::spawn(move || {
+			while *tsv_.get() > -100_000 {
+				if let Some(n) = tsv_.get().checked_sub(1) {
+					tsv_.set(n);
+				}
+			}
+		});
+
+		let tsv_ = tsv.clone();
+		let reader = std::thread::spawn(move || {
+			let mut last = 0;
+			while *tsv_.get() > -100_000 {
+				let val = *tsv_.get();
+				assert!(last >= val, "TSV should always decrease. Last: {}, Current: {}", last, val);
+				last = val;
+			}
+		});
+		writer1.join().unwrap();
+		reader.join().unwrap();
+	}
 }

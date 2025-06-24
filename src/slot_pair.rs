@@ -140,8 +140,6 @@ pub struct InnerSlotPairTSV<T: Sync + Send + 'static> {
 	next_version: AtomicU64,
 	local_key: ThreadLocal<Arc<Wrapper<T>>>,
 	write_lock: Mutex<()>,
-	waiter_signaler: Mutex<()>,
-	waiter_cv: Condvar,
 	waiting_writer_signaler: Mutex<()>,
 	waiting_writer_cv: Condvar,
 }
@@ -161,8 +159,6 @@ impl<T: Sync + Send> InnerSlotPairTSV<T> {
 			next_version: AtomicU64::new(0),
 			local_key: ThreadLocal::new(),
 			write_lock: Mutex::new(()),
-			waiter_signaler: Mutex::new(()),
-			waiter_cv: Condvar::new(),
 			waiting_writer_signaler: Mutex::new(()),
 			waiting_writer_cv: Condvar::new(),
 		};
@@ -179,13 +175,6 @@ impl<T: Sync + Send> InnerSlotPairTSV<T> {
 		}
 		assert!(wrapper.strong_count() > 1, "Wrapper should have strong count > 1 after initialization");
 		tsv.next_version.fetch_add(1, Ordering::SeqCst);
-
-		{
-			let lock = tsv.waiter_signaler.lock();
-			tsv.waiter_cv.notify_one();
-			drop(lock);
-		}
-
 		tsv
 	}
 
