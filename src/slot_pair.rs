@@ -72,11 +72,68 @@ impl<T: Sync + Send> ThreadSafeVar<T> for SlotPairTSV<T> {
 		}
 	}
 
-	fn set(&self, data: T) -> Version {
+	unsafe fn set(&self, data: T) -> Version {
+		// Safety: caller accepts the race condition risk
+		unsafe { self.set_internal(data, None).map_err(|_| ()).unwrap() }
+	}
+
+	fn compare_and_set(&self, data: T, expected_version: Version) -> Result<Version, (T, Version)> {
+		// Safety: we're verifying version, so no race condition
+		unsafe { self.set_internal(data, Some(expected_version)) }
+	}
+
+	fn update<F>(&self, f: F) -> Version
+	where
+		F: Fn(&T) -> T
+	{
+		loop {
+			let current = self.get();
+			let expected = current.version();
+			let new_data = f(&*current);
+			match self.compare_and_set(new_data, expected) {
+				Ok(v) => return v,
+				Err(_) => continue,
+			}
+		}
+	}
+
+	async fn update_async<F, FR>(&self, f: F) -> Version
+	where
+		F: Fn(&T) -> FR + Send,
+		FR: Future<Output = T> + Send
+	{
+		loop {
+			let current = self.get();
+			let expected = current.version();
+			let new_data = f(&*current).await;
+			match self.compare_and_set(new_data, expected) {
+				Ok(v) => return v,
+				Err(_) => continue,
+			}
+		}
+	}
+}
+
+impl<T: Sync + Send + 'static> SlotPairTSV<T> {
+	/// # Safety
+	/// Caller must ensure they've either:
+	/// - Verified the version via `expected_version` parameter, OR
+	/// - Accepted the race condition risk of unconditional writes
+	unsafe fn set_internal(&self, data: T, expected_version: Option<Version>) -> Result<Version, (T, Version)> {
 		let write_lock = self.0.write_lock.lock();
 
 		// next_version is stable because we hold the write lock.
-		let new_version = self.0.next_version.load(Ordering::Acquire);
+		let current_version = self.0.next_version.load(Ordering::Acquire) - 1;
+
+		// Check version if expected_version is provided
+		if let Some(expected) = expected_version {
+			if current_version != expected {
+				drop(write_lock);
+				return Err((data, current_version));
+			}
+		}
+
+		let new_version = current_version + 1;
 		assert_ne!(0, new_version, "Wrapper version should not be 0 because it is incremented on initialisation");
 		let wrapper = Arc::new(Wrapper::new(data, new_version));
 		// Safety: I do not mutate this value.
@@ -104,7 +161,7 @@ impl<T: Sync + Send> ThreadSafeVar<T> for SlotPairTSV<T> {
 		let old_wrapper = unsafe { Arc::from_raw(old_wrapper) };
 		drop(old_wrapper);
 		drop(write_lock);
-		new_version
+		Ok(new_version)
 	}
 }
 impl<T: Sync + Send + Debug> Debug for SlotPairTSV<T> {
